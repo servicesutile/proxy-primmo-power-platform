@@ -104,12 +104,18 @@ try {
 }
 catch {
     $statusCode = 502
+    $upstreamBody = $_.ErrorDetails.Message
     if ($_.Exception.Response -and $_.Exception.Response.StatusCode) {
         $statusCode = [int]$_.Exception.Response.StatusCode
     }
+    if ([string]::IsNullOrWhiteSpace($upstreamBody)) {
+        $upstreamBody = "Upstream error: $($_.Exception.Message)"
+    }
+
+    Write-Host "Upstream $statusCode for entity='$entity' env='$envName': $upstreamBody"
 
     Push-OutputBinding -Name Response -Value ([HttpResponseContext]@{
         StatusCode = [HttpStatusCode]$statusCode
-        Body       = "Upstream error"
+        Body       = $upstreamBody
     })
 }
