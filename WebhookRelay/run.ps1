@@ -10,10 +10,11 @@ function Normalize-Slug([string]$s) {
 $entity  = Normalize-Slug ($Request.Params.entity  ?? $TriggerMetadata.BindingData.entity)
 $envName = Normalize-Slug ($Request.Params.env     ?? $TriggerMetadata.BindingData.env)
 
-Write-Host "Received webhook for entity='$entity' env='$envName'"
+Write-Host "[$($TriggerMetadata.InvocationId)] Received $($Request.Method) webhook for entity='$entity' env='$envName'"
 
 # ---- 0) Validations basiques ----
 if ([string]::IsNullOrWhiteSpace($entity) -or [string]::IsNullOrWhiteSpace($envName)) {
+    Write-Host "[$($TriggerMetadata.InvocationId)] ERROR: Missing route params - entity='$entity' env='$envName'"
     Push-OutputBinding -Name Response -Value ([HttpResponseContext]@{
         StatusCode = [HttpStatusCode]::BadRequest
         Body       = "Missing route params (env/entity)"
@@ -26,6 +27,7 @@ $expectedToken = $env:WEBHOOK_TOKEN
 $tokenHeaderName = $env:WEBHOOK_TOKEN_HEADER
 
 if ([string]::IsNullOrWhiteSpace($expectedToken) -or [string]::IsNullOrWhiteSpace($tokenHeaderName)) {
+    Write-Host "[$($TriggerMetadata.InvocationId)] ERROR: Server misconfigured - WEBHOOK_TOKEN present=$(-not [string]::IsNullOrWhiteSpace($expectedToken)) WEBHOOK_TOKEN_HEADER present=$(-not [string]::IsNullOrWhiteSpace($tokenHeaderName))"
     Push-OutputBinding -Name Response -Value ([HttpResponseContext]@{
         StatusCode = [HttpStatusCode]::InternalServerError
         Body       = "Server misconfigured (WEBHOOK_TOKEN / WEBHOOK_TOKEN_HEADER)"
@@ -36,9 +38,12 @@ if ([string]::IsNullOrWhiteSpace($expectedToken) -or [string]::IsNullOrWhiteSpac
 $receivedToken = $null
 if ($Request.Headers.ContainsKey($tokenHeaderName)) {
     $receivedToken = $Request.Headers[$tokenHeaderName]
+} else {
+    Write-Host "[$($TriggerMetadata.InvocationId)] WARN: Token header '$tokenHeaderName' not present in request"
 }
 
 if ($receivedToken -ne $expectedToken) {
+    Write-Host "[$($TriggerMetadata.InvocationId)] ERROR: Token validation failed for entity='$entity' env='$envName'"
     Push-OutputBinding -Name Response -Value ([HttpResponseContext]@{
         StatusCode = [HttpStatusCode]::Unauthorized
         Body       = "Invalid token"
@@ -46,12 +51,17 @@ if ($receivedToken -ne $expectedToken) {
     return
 }
 
+Write-Host "[$($TriggerMetadata.InvocationId)] Token validated OK"
+
 # ---- 2) Mapper (entity + env) -> destination ----
 # Clé attendue: ENTITY_{entity}_{env}
 $destEnvKey = "ENTITY_{0}_{1}" -f $entity, $envName
 $destUrl = [Environment]::GetEnvironmentVariable($destEnvKey)
 
+Write-Host "[$($TriggerMetadata.InvocationId)] Destination lookup: key='$destEnvKey' found=$(-not [string]::IsNullOrWhiteSpace($destUrl))"
+
 if ([string]::IsNullOrWhiteSpace($destUrl)) {
+    Write-Host "[$($TriggerMetadata.InvocationId)] ERROR: No mapping found for key='$destEnvKey'"
     Push-OutputBinding -Name Response -Value ([HttpResponseContext]@{
         StatusCode = [HttpStatusCode]::NotFound
         Body       = "No mapping for: $destEnvKey"
@@ -71,6 +81,8 @@ foreach ($kvp in $Request.Headers.GetEnumerator()) {
 $forwardHeaders["X-Webhook-Entity"] = $entity
 $forwardHeaders["X-Webhook-Env"] = $envName
 
+Write-Host "[$($TriggerMetadata.InvocationId)] Forwarding $($forwardHeaders.Count) headers"
+
 $body = $null
 if ($Request.Method -ne "GET") {
     if ($null -ne $Request.Body -and $Request.Body -isnot [string] -and $Request.Body -isnot [byte[]]) {
@@ -78,12 +90,21 @@ if ($Request.Method -ne "GET") {
         if (-not $forwardHeaders.ContainsKey("Content-Type")) {
             $forwardHeaders["Content-Type"] = "application/json"
         }
+        Write-Host "[$($TriggerMetadata.InvocationId)] Body serialized from object: $($body.Length) chars"
     } else {
         $body = $Request.Body
+        $bodySize = if ($null -eq $body) { 0 } elseif ($body -is [byte[]]) { $body.Length } else { $body.ToString().Length }
+        Write-Host "[$($TriggerMetadata.InvocationId)] Body type=$($body?.GetType().Name ?? 'null') size=$bodySize"
     }
+} else {
+    Write-Host "[$($TriggerMetadata.InvocationId)] GET request, no body"
 }
 
+Write-Host "[$($TriggerMetadata.InvocationId)] Forwarding $($Request.Method) -> $destUrl"
+
 try {
+    $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+
     $resp = Invoke-WebRequest -Uri $destUrl `
                               -Method $Request.Method `
                               -Headers $forwardHeaders `
@@ -91,7 +112,12 @@ try {
                               -TimeoutSec 30 `
                               -UseBasicParsing
 
+    $stopwatch.Stop()
+
     $contentType = $resp.Headers["Content-Type"]
+    $responseSize = if ($resp.Content -is [byte[]]) { $resp.Content.Length } else { $resp.Content?.Length ?? 0 }
+
+    Write-Host "[$($TriggerMetadata.InvocationId)] Upstream responded $($resp.StatusCode) in $($stopwatch.ElapsedMilliseconds)ms content-type='$contentType' size=$responseSize"
 
     $outHeaders = @{}
     if ($contentType) { $outHeaders["Content-Type"] = $contentType }
@@ -112,7 +138,8 @@ catch {
         $upstreamBody = "Upstream error: $($_.Exception.Message)"
     }
 
-    Write-Host "Upstream $statusCode for entity='$entity' env='$envName': $upstreamBody"
+    Write-Host "[$($TriggerMetadata.InvocationId)] ERROR: Upstream $statusCode for entity='$entity' env='$envName' exception='$($_.Exception.GetType().Name)' message='$($_.Exception.Message)'"
+    Write-Host "[$($TriggerMetadata.InvocationId)] Upstream response body: $upstreamBody"
 
     Push-OutputBinding -Name Response -Value ([HttpResponseContext]@{
         StatusCode = [HttpStatusCode]$statusCode
