@@ -100,7 +100,8 @@ if ($Request.Method -ne "GET") {
     Write-Host "[$($TriggerMetadata.InvocationId)] GET request, no body"
 }
 
-Write-Host "[$($TriggerMetadata.InvocationId)] Forwarding $($Request.Method) -> $destUrl"
+$maskedUrl = $destUrl -replace '(?<=\?|&)(sig|sv|sp)=[^&]*', '$1=***'
+Write-Host "[$($TriggerMetadata.InvocationId)] Forwarding $($Request.Method) -> $maskedUrl"
 
 try {
     $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
